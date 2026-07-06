@@ -1,7 +1,3 @@
-"""
-fetcher.py — Pulls all useful data from a GitHub repo via GitHub API + raw content
-"""
-
 import os
 import re
 import time
@@ -11,6 +7,7 @@ from requests.exceptions import RequestException, Timeout, ConnectionError
 
 GITHUB_API = "https://api.github.com"
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+GITHUB_MAX_RETRIES = int(os.getenv("GITHUB_MAX_RETRIES", "3"))
 
 IMPORTANT_FILES = [
     "README.md", "README.rst", "README.txt", "readme.md",
@@ -66,7 +63,7 @@ def parse_repo_url(url: str) -> tuple[str, str]:
     raise ValueError(f"Cannot parse GitHub URL: {url}")
 
 
-@_retry_request(max_retries=3, backoff_factor=1.0)
+@_retry_request(max_retries=GITHUB_MAX_RETRIES, backoff_factor=1.0)
 def _fetch_with_retry(url: str, headers: dict, timeout: int) -> requests.Response:
     """Internal function to fetch with retry logic."""
     return requests.get(url, headers=headers, timeout=timeout)
