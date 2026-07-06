@@ -1,12 +1,12 @@
-"""
-analyzer.py — Sends repo data to Claude AI and gets structured analysis back
-"""
-
 import os
 import json
+import time
 import anthropic
+from anthropic import APITimeoutError, APIConnectionError, APIError, RateLimitError
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_MAX_RETRIES = int(os.getenv("ANTHROPIC_MAX_RETRIES", "3"))
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 
 
 SYSTEM_PROMPT = """You are RepoWise, an expert software engineer who analyzes GitHub repositories.
@@ -88,12 +88,38 @@ def analyze_repo(repo_data: dict, depth: str = "standard") -> dict:
 
     max_tokens = {"quick": 800, "standard": 1500, "deep": 2500}.get(depth, 1500)
 
-    message = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=max_tokens,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    # Retry logic for API calls
+    max_retries = ANTHROPIC_MAX_RETRIES
+    last_exception = None
+    
+    for attempt in range(max_retries):
+        try:
+            message = client.messages.create(
+                model=ANTHROPIC_MODEL,
+                max_tokens=max_tokens,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": prompt}],
+                timeout=60
+            )
+            break
+        except RateLimitError as e:
+            last_exception = e
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                time.sleep(wait_time)
+            else:
+                raise ValueError(f"Anthropic API rate limit exceeded. Please try again later.") from e
+        except (APITimeoutError, APIConnectionError) as e:
+            last_exception = e
+            if attempt < max_retries - 1:
+                wait_time = 1 * (2 ** attempt)
+                time.sleep(wait_time)
+            else:
+                raise ValueError(f"Anthropic API connection failed after {max_retries} retries: {e}") from e
+        except APIError as e:
+            raise ValueError(f"Anthropic API error: {e}") from e
+        except Exception as e:
+            raise ValueError(f"Unexpected error calling Anthropic API: {e}") from e
 
     raw = message.content[0].text.strip()
 
