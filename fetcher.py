@@ -4,8 +4,10 @@ fetcher.py — Pulls all useful data from a GitHub repo via GitHub API + raw con
 
 import os
 import re
+import time
 import requests
 from typing import Optional
+from requests.exceptions import RequestException, Timeout, ConnectionError
 
 GITHUB_API = "https://api.github.com"
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
@@ -21,6 +23,27 @@ IMPORTANT_FILES = [
 ]
 
 IMPORTANT_SOURCE_DIRS = ["src", "lib", "core", "app", "pkg", "internal"]
+
+
+def _retry_request(max_retries: int = 3, backoff_factor: float = 1.0):
+    """Decorator for retrying requests with exponential backoff."""
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except (Timeout, ConnectionError) as e:
+                    last_exception = e
+                    if attempt < max_retries - 1:
+                        wait_time = backoff_factor * (2 ** attempt)
+                        time.sleep(wait_time)
+                except RequestException as e:
+                    # For other request exceptions, don't retry
+                    raise
+            raise Timeout(f"Request failed after {max_retries} retries. Last error: {last_exception}")
+        return wrapper
+    return decorator
 
 
 def _headers() -> dict:
@@ -43,38 +66,66 @@ def parse_repo_url(url: str) -> tuple[str, str]:
     raise ValueError(f"Cannot parse GitHub URL: {url}")
 
 
+@_retry_request(max_retries=3, backoff_factor=1.0)
+def _fetch_with_retry(url: str, headers: dict, timeout: int) -> requests.Response:
+    """Internal function to fetch with retry logic."""
+    return requests.get(url, headers=headers, timeout=timeout)
+
+
 def fetch_repo_data(url: str) -> dict:
     """Fetch comprehensive repo metadata + key file contents."""
-    owner, repo = parse_repo_url(url)
+    try:
+        owner, repo = parse_repo_url(url)
+    except ValueError as e:
+        raise ValueError(f"Invalid GitHub URL: {e}")
 
     # Core repo metadata
-    r = requests.get(f"{GITHUB_API}/repos/{owner}/{repo}", headers=_headers(), timeout=15)
+    try:
+        r = _fetch_with_retry(f"{GITHUB_API}/repos/{owner}/{repo}", _headers(), 15)
+    except Timeout as e:
+        raise ValueError(f"Timeout fetching repo metadata: {e}")
+    except ConnectionError as e:
+        raise ValueError(f"Connection error fetching repo metadata: {e}")
+    except RequestException as e:
+        raise ValueError(f"Network error fetching repo metadata: {e}")
+    
     if r.status_code == 404:
         raise ValueError(f"Repo not found: {owner}/{repo}")
     if r.status_code == 403:
         raise ValueError("GitHub API rate limit hit. Set GITHUB_TOKEN env var for higher limits.")
+    if r.status_code >= 500:
+        raise ValueError(f"GitHub API error (status {r.status_code}): {r.text}")
     r.raise_for_status()
     meta = r.json()
 
     # Languages breakdown
-    lang_r = requests.get(f"{GITHUB_API}/repos/{owner}/{repo}/languages", headers=_headers(), timeout=10)
-    languages = lang_r.json() if lang_r.ok else {}
+    try:
+        lang_r = _fetch_with_retry(f"{GITHUB_API}/repos/{owner}/{repo}/languages", _headers(), 10)
+        languages = lang_r.json() if lang_r.ok else {}
+    except (Timeout, ConnectionError, RequestException):
+        languages = {}
 
     # Top contributors
-    contrib_r = requests.get(
-        f"{GITHUB_API}/repos/{owner}/{repo}/contributors?per_page=5",
-        headers=_headers(), timeout=10
-    )
-    contributors = [c["login"] for c in contrib_r.json()] if contrib_r.ok and isinstance(contrib_r.json(), list) else []
+    try:
+        contrib_r = _fetch_with_retry(
+            f"{GITHUB_API}/repos/{owner}/{repo}/contributors?per_page=5",
+            _headers(), 10
+        )
+        contributors = [c["login"] for c in contrib_r.json()] if contrib_r.ok and isinstance(contrib_r.json(), list) else []
+    except (Timeout, ConnectionError, RequestException):
+        contributors = []
 
     # Repo file tree (top-level)
-    tree_r = requests.get(
-        f"{GITHUB_API}/repos/{owner}/{repo}/git/trees/HEAD?recursive=0",
-        headers=_headers(), timeout=10
-    )
-    tree = []
-    if tree_r.ok:
-        tree = [item["path"] for item in tree_r.json().get("tree", []) if item["type"] in ("blob", "tree")]
+    try:
+        tree_r = _fetch_with_retry(
+            f"{GITHUB_API}/repos/{owner}/{repo}/git/trees/HEAD?recursive=0",
+            _headers(), 10
+        )
+        tree = []
+        if tree_r.ok:
+            tree = [item["path"] for item in tree_r.json().get("tree", []) if item["type"] in ("blob", "tree")]
+    except (Timeout, ConnectionError, RequestException):
+        tree = []
 
     # Fetch key file contents
     file_contents = {}
@@ -87,20 +138,26 @@ def fetch_repo_data(url: str) -> dict:
             file_contents[filepath] = content[:3000]  # truncate large files
 
     # Recent commits (last 5)
-    commits_r = requests.get(
-        f"{GITHUB_API}/repos/{owner}/{repo}/commits?per_page=5",
-        headers=_headers(), timeout=10
-    )
-    recent_commits = []
-    if commits_r.ok and isinstance(commits_r.json(), list):
-        for c in commits_r.json():
-            recent_commits.append(c["commit"]["message"].split("\n")[0])
+    try:
+        commits_r = _fetch_with_retry(
+            f"{GITHUB_API}/repos/{owner}/{repo}/commits?per_page=5",
+            _headers(), 10
+        )
+        recent_commits = []
+        if commits_r.ok and isinstance(commits_r.json(), list):
+            for c in commits_r.json():
+                recent_commits.append(c["commit"]["message"].split("\n")[0])
+    except (Timeout, ConnectionError, RequestException):
+        recent_commits = []
 
     # Open issues / PRs count
-    issues_r = requests.get(
-        f"{GITHUB_API}/repos/{owner}/{repo}/issues?state=open&per_page=1",
-        headers=_headers(), timeout=10
-    )
+    try:
+        issues_r = _fetch_with_retry(
+            f"{GITHUB_API}/repos/{owner}/{repo}/issues?state=open&per_page=1",
+            _headers(), 10
+        )
+    except (Timeout, ConnectionError, RequestException):
+        issues_r = None
 
     return {
         "url": url,
@@ -158,12 +215,23 @@ def _pick_files_to_fetch(tree: list[str]) -> list[str]:
 
 
 def _fetch_file(owner: str, repo: str, path: str, branch: str) -> Optional[str]:
-    """Fetch raw file content from GitHub."""
-    try:
-        url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
-        r = requests.get(url, headers=_headers(), timeout=8)
-        if r.ok and len(r.text) < 50_000:
-            return r.text
-    except Exception:
-        pass
+    """Fetch raw file content from GitHub with retry logic."""
+    max_retries = 2
+    for attempt in range(max_retries):
+        try:
+            url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
+            r = requests.get(url, headers=_headers(), timeout=8)
+            if r.ok and len(r.text) < 50_000:
+                return r.text
+            elif r.status_code >= 500:
+                # Server error, retry
+                if attempt < max_retries - 1:
+                    time.sleep(0.5)
+                    continue
+        except (Timeout, ConnectionError):
+            if attempt < max_retries - 1:
+                time.sleep(0.5)
+                continue
+        except Exception:
+            pass
     return None
